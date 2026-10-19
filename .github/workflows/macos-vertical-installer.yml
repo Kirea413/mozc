@@ -1,0 +1,81 @@
+name: Build vertical-writing macOS installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Mozc source commit or branch to build
+        required: true
+        default: 84be52fd51a292aaefb3d0299076cebf003be3a7
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vertical-macos-installer
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Check out requested source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+
+      - name: Restore dependency downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: src/third_party_cache
+          key: vertical-installer-deps-${{ runner.os }}-${{ hashFiles('src/build_tools/update_deps.py') }}
+
+      - name: Download build dependencies
+        working-directory: src
+        run: python3 build_tools/update_deps.py
+
+      - name: Test native macOS vertical writing
+        working-directory: src
+        run: |
+          bazelisk test //mac:vertical_keymap_test //renderer:vertical_layout_test //mac:mozc_imk_input_controller_test //renderer:vertical_candidate_view_test_macos --macos_cpus=arm64 --test_output=errors --jobs=3 --build_event_json_file=vertical-tests.jsonl
+
+      - name: Build universal Qt
+        working-directory: src
+        run: python3 build_tools/build_qt.py --release --confirm_license --macos_cpus=x86_64,arm64
+
+      - name: Build universal installer
+        working-directory: src
+        run: bazelisk build package --macos_cpus=x86_64,arm64 --config release_build --jobs=3
+
+      - name: Inspect and prepare package
+        run: |
+          mkdir -p artifacts
+          cp src/bazel-bin/mac/Mozc.pkg artifacts/Mozc-Vertical-macOS-Universal.pkg
+          git rev-parse HEAD > artifacts/source-commit.txt
+          shasum -a 256 artifacts/Mozc-Vertical-macOS-Universal.pkg > artifacts/SHA256SUMS.txt
+          pkgutil --expand-full artifacts/Mozc-Vertical-macOS-Universal.pkg expanded-package
+          find expanded-package -type f > artifacts/package-files.txt
+          pkgutil --check-signature artifacts/Mozc-Vertical-macOS-Universal.pkg > artifacts/signature.txt 2>&1 || true
+
+      - name: Upload installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: Mozc-Vertical-macOS-Universal
+          path: artifacts
+          if-no-files-found: error
+
+      - name: Collect failure logs
+        if: failure()
+        working-directory: src
+        run: python3 build_tools/collect_test_logs.py --bep vertical-tests.jsonl --out ../failure-logs
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: macos-installer-failure-logs
+          path: failure-logs
+          if-no-files-found: ignore
